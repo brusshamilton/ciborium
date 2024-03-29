@@ -7,6 +7,7 @@ mod error;
 pub use error::Error;
 
 use alloc::{string::String, vec::Vec};
+use core::{ops::{Deref, DerefMut}};
 
 use ciborium_io::Read;
 use ciborium_ll::*;
@@ -48,19 +49,76 @@ impl<E: de::Error> Expected<E> for Header {
     }
 }
 
+enum Scratch<'b> {
+  Borrowed(&'b mut [u8]),
+  Owned(Vec<u8>),
+}
+
+impl<'b> Deref for Scratch<'b> {
+  type Target = [u8];
+
+  fn deref(&self) -> &Self::Target {
+    match self {
+      Scratch::Borrowed(slice) => slice,
+      Scratch::Owned(vec) => vec,
+    }
+  }
+}
+
+impl<'b> DerefMut for Scratch<'b> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    match self {
+      Scratch::Borrowed(slice) => slice,
+      Scratch::Owned(vec) => vec,
+    }
+  }
+}
+
+/// The default number of bytes of scratch buffer recommended for Deserializer
+/// for most use cases.
+pub const DEFAULT_SCRATCH_SIZE: usize = 4096;
+
+/// The default recursion depth limit recommended for Deserializer for most use
+/// cases.
+pub const DEFAULT_RECURSION_LIMIT: usize = 256;
+
 /// Deserializer
 pub struct Deserializer<'b, R> {
     decoder: Decoder<R>,
-    scratch: &'b mut [u8],
+    scratch: Scratch<'b>,
     recurse: usize,
 }
 
 fn noop(_: u8) {}
 
+impl<R: Read> Deserializer<'static, R> {
+    /// Constructs a Deserializer from a type with [`impl
+    /// ciborium_io::Read`](ciborium_io::Read), using a 4KB buffer on the heap.
+    pub fn from_reader(reader: R) -> Self {
+        let scratch = Scratch::Owned(vec![0; DEFAULT_SCRATCH_SIZE]);
+        Deserializer {
+            decoder: reader.into(),
+            scratch: scratch,
+            recurse: DEFAULT_RECURSION_LIMIT,
+        }
+    }
+}
+
 impl<'a, R: Read> Deserializer<'a, R>
 where
     R::Error: core::fmt::Debug,
 {
+    /// Constructs a Deserializer from a type with [`impl
+    /// ciborium_io::Read`](ciborium_io::Read), using a borrowed buffer.
+    pub fn from_reader_with_buffer(reader: R, buffer : &'a mut [u8]) -> Self {
+        let scratch = Scratch::Borrowed(buffer);
+        Deserializer {
+            decoder: reader.into(),
+            scratch: scratch,
+            recurse: DEFAULT_RECURSION_LIMIT,
+        }
+    }
+
     #[inline]
     fn recurse<V, F: FnOnce(&mut Self) -> Result<V, Error<R::Error>>>(
         &mut self,
@@ -381,7 +439,7 @@ where
 
                     let mut segments = self.decoder.text(len);
                     while let Some(mut segment) = segments.pull()? {
-                        while let Some(chunk) = segment.pull(self.scratch)? {
+                        while let Some(chunk) = segment.pull(&mut self.scratch)? {
                             buffer.push_str(chunk);
                         }
                     }
@@ -427,7 +485,7 @@ where
 
                     let mut segments = self.decoder.bytes(len);
                     while let Some(mut segment) = segments.pull()? {
-                        while let Some(chunk) = segment.pull(self.scratch)? {
+                        while let Some(chunk) = segment.pull(&mut self.scratch)? {
                             buffer.extend_from_slice(chunk);
                         }
                     }
@@ -460,7 +518,7 @@ where
 
                     let mut segments = self.decoder.bytes(len);
                     while let Some(mut segment) = segments.pull()? {
-                        while let Some(chunk) = segment.pull(self.scratch)? {
+                        while let Some(chunk) = segment.pull(&mut self.scratch)? {
                             buffer.extend_from_slice(chunk);
                         }
                     }
@@ -859,7 +917,7 @@ pub fn from_reader<T: de::DeserializeOwned, R: Read>(reader: R) -> Result<T, Err
 where
     R::Error: core::fmt::Debug,
 {
-    let mut scratch = [0; 4096];
+    let mut scratch = [0; DEFAULT_SCRATCH_SIZE];
     from_reader_with_buffer(reader, &mut scratch)
 }
 
@@ -874,10 +932,11 @@ pub fn from_reader_with_buffer<T: de::DeserializeOwned, R: Read>(
 where
     R::Error: core::fmt::Debug,
 {
+    let scratch = Scratch::Borrowed(scratch_buffer);
     let mut reader = Deserializer {
         decoder: reader.into(),
-        scratch: scratch_buffer,
-        recurse: 256,
+        scratch: scratch,
+        recurse: DEFAULT_RECURSION_LIMIT,
     };
 
     T::deserialize(&mut reader)
@@ -896,11 +955,11 @@ pub fn from_reader_with_recursion_limit<T: de::DeserializeOwned, R: Read>(
 where
     R::Error: core::fmt::Debug,
 {
-    let mut scratch = [0; 4096];
-
+    let mut scratch = [0; DEFAULT_SCRATCH_SIZE];
+    let scratch = Scratch::Borrowed(&mut scratch);
     let mut reader = Deserializer {
         decoder: reader.into(),
-        scratch: &mut scratch,
+        scratch: scratch,
         recurse: recurse_limit,
     };
 
@@ -916,10 +975,11 @@ pub fn deserializer_from_reader_with_buffer<R: Read>(
 where
     R::Error: core::fmt::Debug,
 {
+  let scratch = Scratch::Borrowed(scratch_buffer);
     Deserializer {
         decoder: reader.into(),
-        scratch: scratch_buffer,
-        recurse: 256,
+        scratch: scratch,
+        recurse: DEFAULT_RECURSION_LIMIT,
     }
 }
 
@@ -937,9 +997,10 @@ pub fn deserializer_from_reader_with_buffer_and_recursion_limit<R: Read>(
 where
     R::Error: core::fmt::Debug,
 {
+    let scratch = Scratch::Borrowed(scratch_buffer);
     Deserializer {
         decoder: reader.into(),
-        scratch: scratch_buffer,
+        scratch: scratch,
         recurse: recurse_limit,
     }
 }
